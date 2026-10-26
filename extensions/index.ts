@@ -9,6 +9,8 @@ import type {
 	GrepToolDetails,
 	ReadToolDetails,
 	Theme,
+	ToolRenderers,
+	ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import {
 	AssistantMessageComponent,
@@ -26,6 +28,8 @@ import {
 	createLsTool,
 	createReadTool,
 	createWriteTool,
+	isBashToolResult,
+	isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
 import {
 	Box,
@@ -8420,6 +8424,37 @@ export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
 	const sp = (path: string) => shortPath(cwd, path);
 
+	// pi detects cross-extension tool-name conflicts after all extensions load and treats
+	// any error diagnostic as startup-fatal, so a second registration on an owned name
+	// cannot be caught at registerTool time: the registration must never happen. This
+	// ships just a definition's renderers via registerToolRenderer, which works for tools
+	// this extension does not own; the registry keeps the tool that owns the name.
+	const registerRenderersOnly = (tool: any): void => {
+		pi.registerToolRenderer((toolName, next) =>
+			toolName === tool.name
+				? ({
+					renderShell: tool.renderShell,
+					renderCall: tool.renderCall,
+					renderResult: tool.renderResult,
+				} as ToolRenderers)
+				: next());
+	};
+	// For the runtime re-wrappers (MCP/OpenAI tool definitions rebuilt from records): if
+	// the name turns out to be owned by another extension, the registerTool call throws
+	// and this falls back to renderer-only; their execute is a pure delegate, so nothing
+	// else is lost by dropping the re-registration.
+	const registerOrRendererFallback = (tool: any): void => {
+		try {
+			pi.registerTool(tool);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (!/conflicts with/.test(message)) throw err;
+			const owner = message.slice(message.indexOf("conflicts with") + 14).trim();
+			console.error(`[pi-claude-code-ui] tool "${tool.name}" is registered by another extension (${owner}); attaching renderers only`);
+			registerRenderersOnly(tool);
+		}
+	};
+
 	const readTool = createReadTool(cwd);
 	pi.registerTool({
 		name: "read",
@@ -8483,26 +8518,39 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const bashTool = createBashTool(cwd);
-	pi.registerTool({
+	// bash ships renderer-only through registerRenderersOnly: the sandbox extension (or
+	// any other) may own the name, and a second registration would fail pi's startup
+	// conflict check. The old execute-wrap's file snapshots for sed/heredoc diff rows
+	// move to events below: tool_call snapshots files before execution, tool_result
+	// injects details.fileEdits for the renderers, tool_execution_end clears calls that
+	// never reach tool_result.
+	const bashFileEditSnapshots = new Map<string, ReturnType<typeof snapshotBashFileEdit>>();
+	pi.on("tool_call", async (event) => {
+		if (!isToolCallEventType("bash", event)) return;
+		const fileEdit = detectBashFileEdit(event.input.command);
+		if (!fileEdit) return;
+		bashFileEditSnapshots.set(event.toolCallId, snapshotBashFileEdit(cwd, fileEdit));
+	});
+	pi.on("tool_result", async (event) => {
+		const before = bashFileEditSnapshots.get(event.toolCallId);
+		bashFileEditSnapshots.delete(event.toolCallId);
+		if (!before || !isBashToolResult(event) || event.isError) return;
+		const fileEdit = detectBashFileEdit(typeof event.input.command === "string" ? event.input.command : "");
+		if (!fileEdit) return;
+		const details = (event.details && typeof event.details === "object" ? event.details : {}) as Record<string, unknown>;
+		return { details: { ...details, fileEdits: collectBashFileEdits(cwd, fileEdit, before) } };
+	});
+	pi.on("tool_execution_end", (event) => {
+		bashFileEditSnapshots.delete(event.toolCallId);
+	});
+	registerRenderersOnly({
 		name: "bash",
 		label: "bash",
 		description: bashTool.description,
 		promptSnippet: (bashTool as any).promptSnippet,
 		promptGuidelines: (bashTool as any).promptGuidelines,
 		parameters: bashTool.parameters,
-		async execute(toolCallId, params, signal, onUpdate) {
-			// A command that only changes files: look at them before and after, so the row
-			// can show a diff like an edit/write row. The command itself runs unchanged.
-			const fileEdit = detectBashFileEdit(typeof params.command === "string" ? params.command : "");
-			const before = fileEdit ? snapshotBashFileEdit(cwd, fileEdit) : undefined;
-			const result = await bashTool.execute(toolCallId, params, signal, onUpdate);
-			if (fileEdit && before) {
-				const details = result.details && typeof result.details === "object" ? result.details : {};
-				(result as any).details = { ...details, fileEdits: collectBashFileEdits(cwd, fileEdit, before) };
-			}
-			return result;
-		},
-		renderCall(args, theme, ctx) {
+		renderCall(args: any, theme: Theme, ctx: any) {
 			syncToolCallStatus(ctx);
 			syncBashDuration(ctx);
 			const rewrite = ensureRtkRewriteForContext(ctx, args);
@@ -8532,7 +8580,7 @@ export default function (pi: ExtensionAPI) {
 			).replace(WRAP_MARK, CLIP_MARK);
 			return makeText(ctx.lastComponent, commandBlock ? `${header}\n${commandBlock}` : header);
 		},
-		renderResult(result, { expanded, isPartial }, theme, ctx) {
+		renderResult(result: any, { expanded, isPartial }: ToolRenderResultOptions, theme: Theme, ctx: any) {
 			syncBashDuration(ctx, isPartial);
 			const details = result.details as BashToolDetails | undefined;
 			const rewrite = ensureRtkRewriteForContext(ctx, ctx.args);
@@ -9021,7 +9069,7 @@ export default function (pi: ExtensionAPI) {
 			const rawLabel = typeof record.label === "string" ? record.label.trim() : "";
 			const label = rawLabel && rawLabel !== name && !rawLabel.includes("_") ? rawLabel : humanizeToolName(name);
 			const description = typeof record.description === "string" ? record.description : label;
-			(pi as any).registerTool({
+			registerOrRendererFallback({
 				name,
 				label,
 				description,
@@ -9066,7 +9114,7 @@ export default function (pi: ExtensionAPI) {
 			if (!execute) continue;
 			const label = typeof record.label === "string" ? record.label : name === "mcp" ? "MCP" : `MCP ${name}`;
 			const description = typeof record.description === "string" ? record.description : "MCP tool";
-			(pi as any).registerTool({
+			registerOrRendererFallback({
 				name,
 				label,
 				description,
