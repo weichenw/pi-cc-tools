@@ -8517,6 +8517,26 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// codemode rows ship renderer-only as well: the tool belongs to pi's built-in codemode
+	// extension, so the same ownership rule applies — resolver, never re-registration. The
+	// headline shows the script's first non-empty line; results use the generic preview.
+	registerRenderersOnly({
+		name: "codemode",
+		renderCall(args: any, theme: Theme, ctx: any) {
+			syncToolCallStatus(ctx);
+			const script = typeof args?.code === "string" ? args.code : "";
+			const firstLine = script.split("\n").find((line: string) => line.trim()) ?? "";
+			const summary = summarizeText(firstLine, 72);
+			return makeText(
+				ctx.lastComponent,
+				toolHeader("Codemode", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+			);
+		},
+		renderResult(result: any, { expanded, isPartial }: ToolRenderResultOptions, theme: Theme, ctx: any) {
+			return renderGenericToolResult("codemode", result, { expanded, isPartial }, theme, ctx);
+		},
+	});
+
 	const bashTool = createBashTool(cwd);
 	// bash ships renderer-only through registerRenderersOnly: the sandbox extension (or
 	// any other) may own the name, and a second registration would fail pi's startup
